@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Text;
 using Gibbed.IO;
 
 namespace watch_dogs_loc
@@ -79,7 +80,7 @@ namespace watch_dogs_loc
                                     id.str = "";
                                     continue;
                                 }
-                                List<UInt16> str_bytes = new List<UInt16>();
+                                StringBuilder lineBuilder = new StringBuilder();
                                 uint byte_offset = ids.start + (id.lo >> 3);
                                 uint bit_left = (id.lo & 7);
                                 input.Position = byte_offset;
@@ -89,9 +90,9 @@ namespace watch_dogs_loc
                                 {
                                     uint current_uint_masked = current_uint & 0xFFFFFFE0;
                                     uint tree_position = FindTreePosition(input, ref bit_length, ref byte_offset, ref bit_left, ref current_uint, current_uint_masked);
-                                    DepthFirstSearch(str_bytes, tree_position);
+                                    DepthFirstSearch(lineBuilder, tree_position);
                                 }
-                                string line = ToString(str_bytes);
+                                string line = lineBuilder.ToString();
                                 id.str = line;
                                 text.WriteLine(id.id + "=" + line.Replace("\r", "[CR]").Replace("\n", "[LF]"));
                             }
@@ -101,7 +102,7 @@ namespace watch_dogs_loc
             }
         }
 
-        private void DepthFirstSearch(List<ushort> str_bytes, uint tree_position)
+        private void DepthFirstSearch(StringBuilder builder, uint tree_position)
         {
             Stack<UInt16> stack = new Stack<UInt16>();
             stack.Push((UInt16)tree_position);
@@ -111,7 +112,7 @@ namespace watch_dogs_loc
                 UInt32 tree_node = tree_entries[idx];
                 if (tree_node <= 0xFFFF)
                 {
-                    str_bytes.Add((UInt16)tree_node);
+                    builder.Append((char)tree_node);
                 }
                 else
                 {
@@ -219,21 +220,6 @@ namespace watch_dogs_loc
             return tree_position;
         }
 
-        private static String ToString(List<UInt16> text)
-        {
-            UInt16[] textData = text.ToArray();
-            byte[] bytes = new byte[textData.Length * 2];
-            Buffer.BlockCopy(textData, 0, bytes, 0, textData.Length * 2);
-            return System.Text.Encoding.Unicode.GetString(bytes);
-        }
-
-        private static UInt16[] ToUInt16(String text)
-        {
-            byte[] bytes = System.Text.Encoding.Unicode.GetBytes(text);
-            UInt16[] textData = new UInt16[bytes.Length / 2];
-            Buffer.BlockCopy(bytes, 0, textData, 0, bytes.Length);
-            return textData;
-        }
     }
 
     public class Table
