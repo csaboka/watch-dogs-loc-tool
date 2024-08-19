@@ -19,6 +19,8 @@ namespace watch_dogs_loc
 
         uint nodes_count;
 
+        uint[] tree_entries;
+
         public void Read(Stream input)
         {
             magic = input.ReadValueS16();
@@ -51,6 +53,10 @@ namespace watch_dogs_loc
 
         public void Export(Stream input, String filename)
         {
+            input.Position = tree_offset;
+            byte[] treeRaw = input.ReadBytes(nodes_count * 4);
+            tree_entries = new uint[nodes_count];
+            Buffer.BlockCopy(treeRaw, 0, tree_entries, 0, (int)(nodes_count * 4));
             using (StreamWriter text = new StreamWriter(filename + ".txt", false, System.Text.Encoding.Unicode))
             {
                 foreach (Table t in table)
@@ -83,7 +89,7 @@ namespace watch_dogs_loc
                                 {
                                     uint current_uint_masked = current_uint & 0xFFFFFFE0;
                                     uint tree_position = FindTreePosition(input, ref bit_length, ref byte_offset, ref bit_left, ref current_uint, current_uint_masked);
-                                    DepthFirstSearch(input, str_bytes, tree_position);
+                                    DepthFirstSearch(str_bytes, tree_position);
                                 }
                                 string line = ToString(str_bytes);
                                 id.str = line;
@@ -95,15 +101,14 @@ namespace watch_dogs_loc
             }
         }
 
-        private void DepthFirstSearch(Stream input, List<ushort> str_bytes, uint tree_position)
+        private void DepthFirstSearch(List<ushort> str_bytes, uint tree_position)
         {
             Stack<UInt16> stack = new Stack<UInt16>();
             stack.Push((UInt16)tree_position);
             while (stack.Count > 0)
             {
                 UInt16 idx = stack.Pop();
-                input.Position = tree_offset + 4 * idx;
-                UInt32 tree_node = input.ReadValueU32();
+                UInt32 tree_node = tree_entries[idx];
                 if (tree_node <= 0xFFFF)
                 {
                     str_bytes.Add((UInt16)tree_node);
