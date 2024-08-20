@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.MemoryMappedFiles;
 using System.Text;
 using Gibbed.IO;
 
@@ -52,12 +53,10 @@ namespace watch_dogs_loc
             nodes_count = input.ReadValueU32();
         }
 
-        public void Export(Stream input, String filename)
+        public void Export(MemoryMappedViewAccessor accessor, String filename)
         {
-            input.Position = tree_offset;
-            byte[] treeRaw = input.ReadBytes(nodes_count * 4);
             tree_entries = new uint[nodes_count];
-            Buffer.BlockCopy(treeRaw, 0, tree_entries, 0, (int)(nodes_count * 4));
+            accessor.ReadArray(tree_offset, tree_entries, 0, (int)nodes_count);
             using (StreamWriter text = new StreamWriter(filename + ".txt", false, System.Text.Encoding.Unicode))
             {
                 foreach (Table t in table)
@@ -73,7 +72,7 @@ namespace watch_dogs_loc
                                     continue;
                                 }
 
-                                uint bit_length = id.hi - id.lo;
+                                int bit_length = (int)(id.hi - id.lo);
                                 if (bit_length == 0)
                                 {
                                     text.WriteLine(id.id + "=");
@@ -81,15 +80,10 @@ namespace watch_dogs_loc
                                     continue;
                                 }
                                 StringBuilder lineBuilder = new StringBuilder();
-                                uint byte_offset = ids.start + (id.lo >> 3);
-                                uint bit_left = (id.lo & 7);
-                                input.Position = byte_offset;
-                                uint current_uint = input.ReadValueU32(Endian.Big) << (byte)bit_left;
-                                byte_offset += 4;
-                                while ((Int32)bit_length > 0)
+                                BitReader reader = new BitReader(accessor, (int)(ids.start * 8 + id.lo));
+                                while (bit_length > 0)
                                 {
-                                    uint current_uint_masked = current_uint & 0xFFFFFFE0;
-                                    uint tree_position = FindTreePosition(input, ref bit_length, ref byte_offset, ref bit_left, ref current_uint, current_uint_masked);
+                                    uint tree_position = FindTreePosition(reader, ref bit_length);
                                     DepthFirstSearch(lineBuilder, tree_position);
                                 }
                                 string line = lineBuilder.ToString();
@@ -122,10 +116,11 @@ namespace watch_dogs_loc
             }
         }
 
-        private uint FindTreePosition(Stream input, ref uint bit_length, ref uint byte_offset, ref uint bit_left, ref uint current_uint, uint current_uint_masked)
+        private uint FindTreePosition(BitReader reader, ref int bit_length)
         {
-            uint tree_position;
-            bool was_24 = false;
+            uint current_uint_masked = reader.PeekBits(27);
+            int bits_to_read;
+            uint offset;
             if (current_uint_masked >= tree_meta[6])
             {
                 if (current_uint_masked >= tree_meta[8])
@@ -134,30 +129,13 @@ namespace watch_dogs_loc
                     {
                         Environment.Exit(42);
                     }
-                    was_24 = true;
-                    bit_length -= 24;
-                    tree_position = tree_meta[11] + current_uint_masked >> 8;
-                    //// fixing
-                    bit_left += 16;
-                    input.Position = byte_offset;
-                    uint next_byte = input.ReadValueU8();
-                    byte_offset += 1;
-                    current_uint = (current_uint << 24) + (next_byte << (byte)bit_left);
-                    if (bit_left >= 16)
-                    {
-                        bit_left -= 8;
-                        next_byte = input.ReadValueU8();
-                        byte_offset += 1;
-                        current_uint += (next_byte << (byte)bit_left);
-                    }
+                    bits_to_read = 24;
+                    offset = tree_meta[11];
                 }
                 else
                 {
-                    // consume 16 bits
-                    current_uint <<= 16;
-                    bit_length -= 16;
-                    tree_position = tree_meta[9] + current_uint_masked >> 16;
-                    bit_left += 8;
+                    bits_to_read = 16;
+                    offset = tree_meta[9];
                 }
             }
             else
@@ -166,58 +144,34 @@ namespace watch_dogs_loc
                 {
                     if (current_uint_masked >= tree_meta[4])
                     {
-                        // consume 14 bits
-                        current_uint <<= 14;
-                        bit_length -= 14;
-                        tree_position = tree_meta[7] + current_uint_masked >> 18;
-                        bit_left += 6;
+                        bits_to_read = 14;
+                        offset = tree_meta[7];
 
                     }
                     else
                     {
-                        // consume 12 bits
-                        current_uint <<= 12;
-                        bit_length -= 12;
-                        tree_position = tree_meta[5] + current_uint_masked >> 20;
-                        bit_left += 4;
+                        bits_to_read = 12;
+                        offset = tree_meta[5];
                     }
                 }
                 else
                 {
                     if (current_uint_masked >= tree_meta[0])
                     {
-                        // consume 10 bits
-                        current_uint <<= 10;
-                        bit_length -= 10;
-                        tree_position = tree_meta[3] + current_uint_masked >> 22;
-                        bit_left += 2;
+                        bits_to_read = 10;
+                        offset = tree_meta[3];
 
                     }
                     else
                     {
-                        // consume 8 bits
-                        current_uint <<= 8;
-                        bit_length -= 8;
-                        tree_position = tree_meta[1] + current_uint_masked >> 24;
+                        bits_to_read = 8;
+                        offset = tree_meta[1];
                     }
                 }
             }
-            if (!was_24)
-            {
-                input.Position = byte_offset;
-                uint next_byte = input.ReadValueU8();
-                byte_offset += 1;
-                current_uint += (next_byte << (byte)bit_left);
-            }
-            if (bit_left >= 8)
-            {
-                bit_left -= 8;
-                uint next_byte = input.ReadValueU8();
-                byte_offset += 1;
-                current_uint += (next_byte << (byte)bit_left);
-            }
 
-            return tree_position;
+            bit_length -= bits_to_read;
+            return (reader.ReadBits(bits_to_read) + offset) >> (32 - bits_to_read);
         }
 
     }
@@ -427,6 +381,37 @@ namespace watch_dogs_loc
                 hi = current_size_in_bits;
                 ++k;
             }
+        }
+    }
+
+    public class BitReader
+    {
+        readonly MemoryMappedViewAccessor accessor;
+        int position;
+
+        public BitReader(MemoryMappedViewAccessor accessor, int position)
+        {
+            this.accessor = accessor;
+            this.position = position;
+        }
+
+        public uint PeekBits(int count)
+        {
+            if (count < 1 || count > 32)
+            {
+                throw new ArgumentException("Bit count out of range: " + count);
+            }
+            ulong answer = accessor.ReadUInt64(position >> 3).Swap();
+            answer >>= (32 - (position & 7));
+            int mask = int.MinValue >> (count - 1);
+            return ((uint)answer) & ((uint)mask);
+        }
+
+        public uint ReadBits(int count)
+        {
+            uint answer = PeekBits(count);
+            this.position += count;
+            return answer;
         }
     }
 }
