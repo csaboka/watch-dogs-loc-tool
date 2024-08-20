@@ -121,55 +121,13 @@ namespace watch_dogs_loc
             uint current_uint_masked = reader.PeekBits(27);
             int bits_to_read;
             uint offset;
-            if (current_uint_masked >= tree_meta[6])
+            int i = 0;
+            while (current_uint_masked >= tree_meta[i])
             {
-                if (current_uint_masked >= tree_meta[8])
-                {
-                    if (current_uint_masked >= tree_meta[10])
-                    {
-                        Environment.Exit(42);
-                    }
-                    bits_to_read = 24;
-                    offset = tree_meta[11];
-                }
-                else
-                {
-                    bits_to_read = 16;
-                    offset = tree_meta[9];
-                }
+                i += 2;
             }
-            else
-            {
-                if (current_uint_masked >= tree_meta[2])
-                {
-                    if (current_uint_masked >= tree_meta[4])
-                    {
-                        bits_to_read = 14;
-                        offset = tree_meta[7];
-
-                    }
-                    else
-                    {
-                        bits_to_read = 12;
-                        offset = tree_meta[5];
-                    }
-                }
-                else
-                {
-                    if (current_uint_masked >= tree_meta[0])
-                    {
-                        bits_to_read = 10;
-                        offset = tree_meta[3];
-
-                    }
-                    else
-                    {
-                        bits_to_read = 8;
-                        offset = tree_meta[1];
-                    }
-                }
-            }
-
+            offset = tree_meta[i + 1];
+            bits_to_read = (int)(offset & 0x1F);
             bit_length -= bits_to_read;
             return (reader.ReadBits(bits_to_read) + offset) >> (32 - bits_to_read);
         }
