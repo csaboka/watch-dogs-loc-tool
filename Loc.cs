@@ -63,6 +63,48 @@ namespace watch_dogs_loc
             }
         }
 
+        public void Write(Stream output)
+        {
+            output.WriteValueS16(0x4c53);
+            output.WriteValueS16(1);
+            output.WriteValueS16(language);
+            output.WriteValueS16((short)table.Length);
+            long tree_offset_pos = output.Position;
+            output.WriteValueU32(0);
+            long table_start_pos = output.Position;
+            // Write dummy data just to advance the pointer. We'll come back and overwrite it at the end.
+            // This relies on the fact that table headers are fixed size.
+            foreach (Table table in table)
+            {
+                table.Write(output);
+            }
+            foreach (Table table in table)
+            {
+                table.offset = (uint)output.Position;
+                table.WriteData(output, this);
+            }
+            while ((output.Position & 3) != 0)
+            {
+                output.WriteByte(0);
+            }
+            foreach (uint meta in tree_meta.Reverse())
+            {
+                output.WriteValueU32(meta);
+            }
+            long tree_offset = output.Position;
+            foreach (uint entry in tree_entries)
+            {
+                output.WriteValueU32(entry);
+            }
+            output.Position = tree_offset_pos;
+            output.WriteValueU32((uint)tree_offset);
+            output.Position = table_start_pos;
+            foreach (Table table in table)
+            {
+                table.Write(output);
+            }
+        }
+
         public void Export(String filename)
         {
             using (StreamWriter text = new StreamWriter(filename + ".txt", false, System.Text.Encoding.Unicode))
@@ -126,6 +168,27 @@ namespace watch_dogs_loc
             return (reader.ReadBits(bits_to_read) + offset) >> (32 - bits_to_read);
         }
 
+        public void WriteTreePosition(BitWriter writer, uint value)
+        {
+            for (int i = 0; ; i += 2)
+            {
+                uint offset = tree_meta[i + 1];
+                int bits_to_write = (int)(offset & 0x1F);
+                uint candidate = (value << (32 - bits_to_write)) - (offset & ~0x1fu);
+                bool matchesEarlier = false;
+                for (int j = 0; j < i; j += 2)
+                {
+                    matchesEarlier |= candidate < tree_meta[j];
+                }
+                if (!matchesEarlier && candidate < tree_meta[i] && ((candidate + offset) >> (32 - bits_to_write)) == value)
+                {
+                    // found the right offset and bit count
+                    writer.Write(candidate >> (32 - bits_to_write), bits_to_write);
+                    return;
+                }
+            }
+        }
+
     }
 
     public class Table
@@ -177,6 +240,28 @@ namespace watch_dogs_loc
 
             return block_position;
         }
+
+        public void Write(Stream output)
+        {
+            output.WriteValueU32(first_id);
+            output.WriteValueU32(offset << 4 | length);
+        }
+
+        public void WriteData(Stream output, Loc loc)
+        {
+            MemoryStream subTablesData = new MemoryStream();
+            for (int i = 0; i < length; i++)
+            {
+                long start = subTablesData.Position;
+                sub_table_ids[i].Write(sub_table_metas[i], subTablesData, loc);
+                sub_table_metas[i].size = (uint)(subTablesData.Position - start);
+            }
+            foreach (SubTableMeta meta in sub_table_metas)
+            {
+                meta.Write(output);
+            }
+            output.WriteBytes(subTablesData.ToArray());
+        }
     }
 
     public class SubTableMeta
@@ -205,6 +290,31 @@ namespace watch_dogs_loc
                 max_id = first >> 7;
                 size = (whole >> 12) & 0x7FF;
                 delta_from_prev_id &= 0xFFF;
+            }
+        }
+
+        public void Write(Stream output)
+        {
+            if (max_id <= 0x7F && size <= 0x7FF && delta_from_prev_id <= 0xFFF)
+            {
+                uint tmp = (max_id << 23) | (size << 12) | delta_from_prev_id;
+                output.WriteValueU16((ushort)(tmp >> 16));
+                output.WriteValueU16((ushort)(tmp & 0xFFFF));
+            }
+            else
+            {
+                uint tmp = 0x80000000 | (max_id << 16) | (delta_from_prev_id & 0xFFFF);
+                if (delta_from_prev_id > 0xFFFF)
+                {
+                    tmp |= 0x40000000;
+                }
+                output.WriteValueU16((ushort)(tmp >> 16));
+                output.WriteValueU16((ushort)(tmp & 0xFFFF));
+                output.WriteValueU16((ushort)size);
+                if (delta_from_prev_id > 0xFFFF)
+                {
+                    output.WriteValueU16((ushort)(delta_from_prev_id >> 16));
+                }
             }
         }
     }
@@ -282,6 +392,59 @@ namespace watch_dogs_loc
 
             id_begin += id_count;
         }
+
+        public void Write(SubTableMeta subTable, Stream output, Loc loc)
+        {
+            uint id_count = subTable.max_id + 1;
+            uint block_64ids_count = (id_count - 1) >> 6;
+
+            long start = output.Position;
+            ushort[] block_64ids_offsets = new ushort[block_64ids_count];
+            // write placeholder data
+            output.WriteBytes(new byte[block_64ids_count * 2]);
+
+            for (int i = 0; i < ids.Count; i++)
+            {
+                List<Id> ids_in_block = ids[i];
+                if (ids_in_block.Count == 0)
+                {
+                    continue;
+                }
+                if (i > 0)
+                {
+                    block_64ids_offsets[i - 1] = (ushort)(output.Position - start);
+                }
+                MemoryStream tmpBits = new MemoryStream();
+                BitWriter bitWriter = new BitWriter(tmpBits, 0);
+                foreach (Id id in ids_in_block)
+                {
+                    if (id.is_pseudo)
+                    {
+                        continue;
+                    }
+                    int before = bitWriter.Position;
+                    foreach (uint ptr in id.tree_pointers)
+                    {
+                        loc.WriteTreePosition(bitWriter, ptr);
+                    }
+                    id.increment = (uint)(bitWriter.Position - before);
+                }
+                bitWriter.Close();
+                foreach (Id id in ids_in_block)
+                {
+                    id.Write(output);
+                }
+                output.WriteBytes(tmpBits.ToArray());
+            }
+            // replace placeholder data with real one
+            long end = output.Position;
+            output.Position = start;
+            foreach (ushort offset in block_64ids_offsets)
+            {
+                output.WriteValueU16(offset);
+            }
+            output.Position = end;
+        }
     }
 
     public class Id
@@ -339,6 +502,40 @@ namespace watch_dogs_loc
                 ++k;
             }
         }
+
+        public void Write(Stream output)
+        {
+            if (is_pseudo)
+            {
+                output.WriteValueU8((byte)(increment + 0xF0));
+            }
+            else
+            {
+                uint adjusted_size = increment == 0 ? 0 : (increment - 4) / 2;
+                if (adjusted_size >= 0x114dc)
+                {
+                    Console.WriteLine("Bit string too big: " + adjusted_size);
+                    Environment.Exit(2);
+                }
+                else if (adjusted_size >= 0x14dc)
+                {
+                    output.WriteValueU8(0xF0);
+                    uint tmp = adjusted_size - 5340;
+                    output.WriteValueU8((byte)(tmp >> 8));
+                    output.WriteValueU8((byte)(tmp & 0xFF));
+                }
+                else if (adjusted_size >= 0xdc)
+                {
+                    uint tmp = adjusted_size + 56100;
+                    output.WriteValueU8((byte)(tmp >> 8));
+                    output.WriteValueU8((byte)(tmp & 0xFF));
+                }
+                else
+                {
+                    output.WriteValueU8((byte)adjusted_size);
+                }
+            }
+        }
     }
 
     public class BitReader
@@ -374,6 +571,46 @@ namespace watch_dogs_loc
         public void Seek(int offset)
         {
             this.position += offset;
+        }
+    }
+
+    public class BitWriter
+    {
+        readonly Stream stream;
+        ulong pendingBits;
+        int pendingBitCount;
+
+        public BitWriter(Stream stream, int position)
+        {
+            this.stream = stream;
+            this.Position = position;
+        }
+
+        public int Position { get; private set; }
+
+        public void Write(uint bits, int bitCount)
+        {
+            if (bitCount < 1 || bitCount > 32)
+            {
+                throw new ArgumentException("Bit count out of range: " + bitCount);
+            }
+            pendingBits |= (ulong)bits << (64 - bitCount - pendingBitCount);
+            pendingBitCount += bitCount;
+            while (pendingBitCount >= 8)
+            {
+                stream.WriteValueU8((byte)(pendingBits >> 56));
+                pendingBits <<= 8;
+                pendingBitCount -= 8;
+            }
+            Position += bitCount;
+        }
+
+        public void Close()
+        {
+            if (pendingBitCount > 0)
+            {
+                stream.WriteValueU8((byte)(pendingBits >> 56));
+            }
         }
     }
 }
