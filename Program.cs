@@ -13,15 +13,15 @@ namespace watch_dogs_loc
             {
                 Help();  
             }
+            Loc loc = new Loc();
             using (MemoryMappedFile file = MemoryMappedFile.CreateFromFile(args[0], FileMode.Open))
             using (Stream stream = file.CreateViewStream())
             using (MemoryMappedViewAccessor accessor = file.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read))
             {
-                Loc loc = new Loc();
-                loc.Read(stream);
-                loc.Export(accessor, args[0]);
-                Console.WriteLine("Done!");
+                loc.Read(stream, accessor);
             }
+            loc.Export(args[0]);
+            Console.WriteLine("Done!");
         }
 
         private static void Help()

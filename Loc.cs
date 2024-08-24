@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.IO;
 using System.IO.MemoryMappedFiles;
+using System.Linq;
 using System.Text;
 using Gibbed.IO;
 
@@ -23,7 +24,7 @@ namespace watch_dogs_loc
 
         uint[] tree_entries;
 
-        public void Read(Stream input)
+        public void Read(Stream input, MemoryMappedViewAccessor accessor)
         {
             magic = input.ReadValueS16();
             version = input.ReadValueS16();
@@ -35,28 +36,35 @@ namespace watch_dogs_loc
             language = input.ReadValueS16();
             table_length = input.ReadValueU16();
             tree_offset = input.ReadValueU32();
+            nodes_count = accessor.ReadUInt32(tree_offset);
+            tree_entries = new uint[nodes_count];
+            accessor.ReadArray(tree_offset, tree_entries, 0, (int)nodes_count);
+            List<uint> tree_meta_tmp = new List<uint>();
+            uint ptr = tree_offset;
+            do
+            {
+                tree_meta_tmp.Add(accessor.ReadUInt32(ptr - 4));
+                tree_meta_tmp.Add(accessor.ReadUInt32(ptr - 8));
+                ptr -= 8;
+            } while (tree_meta_tmp[tree_meta_tmp.Count - 2] != 0xFFFFFFFF);
+            tree_meta = tree_meta_tmp.ToArray();
             table = new Table[table_length];
             long end_of_tables = -1;
             for (ushort i = 0; i < table_length; ++i)
             {
                 table[i] = new Table();
-                end_of_tables = table[i].Read(input);
+                end_of_tables = table[i].Read(input, accessor, this);
             }
-            tree_meta_offset = (uint)(end_of_tables + (-end_of_tables & 3));
-            uint tree_meta_length = (tree_offset - tree_meta_offset) >> 2;
-            tree_meta = new uint[tree_meta_length];
-            input.Position = tree_meta_offset;
-            for (uint i = 0; i < tree_meta_length; ++i)
+            uint end_of_tables_aligned = (uint)(end_of_tables + (-end_of_tables & 3));
+            if (end_of_tables_aligned != ptr)
             {
-                tree_meta[(tree_meta_length - i - 1)] = input.ReadValueU32();
+                Console.WriteLine("Unexpected data at " + end_of_tables_aligned);
+                Environment.Exit(1);
             }
-            nodes_count = input.ReadValueU32();
         }
 
-        public void Export(MemoryMappedViewAccessor accessor, String filename)
+        public void Export(String filename)
         {
-            tree_entries = new uint[nodes_count];
-            accessor.ReadArray(tree_offset, tree_entries, 0, (int)nodes_count);
             using (StreamWriter text = new StreamWriter(filename + ".txt", false, System.Text.Encoding.Unicode))
             {
                 foreach (Table t in table)
@@ -71,22 +79,7 @@ namespace watch_dogs_loc
                                 {
                                     continue;
                                 }
-
-                                int bit_length = (int)(id.hi - id.lo);
-                                if (bit_length == 0)
-                                {
-                                    text.WriteLine(id.id + "=");
-                                    id.str = "";
-                                    continue;
-                                }
-                                StringBuilder lineBuilder = new StringBuilder();
-                                BitReader reader = new BitReader(accessor, (int)(ids.start * 8 + id.lo));
-                                while (bit_length > 0)
-                                {
-                                    uint tree_position = FindTreePosition(reader, ref bit_length);
-                                    DepthFirstSearch(lineBuilder, tree_position);
-                                }
-                                string line = lineBuilder.ToString();
+                                string line = DecodeString(id.tree_pointers);
                                 id.str = line;
                                 text.WriteLine(id.id + "=" + line.Replace("\r", "[CR]").Replace("\n", "[LF]"));
                             }
@@ -96,27 +89,28 @@ namespace watch_dogs_loc
             }
         }
 
-        private void DepthFirstSearch(StringBuilder builder, uint tree_position)
+        private string DecodeString(uint[] tree_positions)
         {
-            Stack<UInt16> stack = new Stack<UInt16>();
-            stack.Push((UInt16)tree_position);
+            Stack<uint> stack = new Stack<uint>(tree_positions.Reverse());
+            StringBuilder builder = new StringBuilder();
             while (stack.Count > 0)
             {
-                UInt16 idx = stack.Pop();
-                UInt32 tree_node = tree_entries[idx];
+                uint idx = stack.Pop();
+                uint tree_node = tree_entries[idx];
                 if (tree_node <= 0xFFFF)
                 {
                     builder.Append((char)tree_node);
                 }
                 else
                 {
-                    stack.Push((UInt16)tree_node);
-                    stack.Push((UInt16)(tree_node >> 16));
+                    stack.Push(tree_node & 0xFFFF);
+                    stack.Push(tree_node >> 16);
                 }
             }
+            return builder.ToString();
         }
 
-        private uint FindTreePosition(BitReader reader, ref int bit_length)
+        public uint FindTreePosition(BitReader reader, ref int bit_length)
         {
             uint current_uint_masked = reader.PeekBits(27);
             int bits_to_read;
@@ -145,7 +139,7 @@ namespace watch_dogs_loc
         public SubTableMeta[] sub_table_metas;
         public SubTableIds[] sub_table_ids;
 
-        public long Read(Stream input)
+        public long Read(Stream input, MemoryMappedViewAccessor accessor, Loc loc)
         {
             first_id = input.ReadValueU32();
             offset_length = input.ReadValueU32();
@@ -174,7 +168,7 @@ namespace watch_dogs_loc
                 block_first_id += sub_table_metas[i].delta_from_prev_id;
 
                 sub_table_ids[i] = new SubTableIds((uint)block_position);
-                sub_table_ids[i].Read(ref block_first_id, sub_table_metas[i], input);
+                sub_table_ids[i].Read(ref block_first_id, sub_table_metas[i], input, accessor, loc);
 
                 block_position += sub_table_metas[i].size;
             }
@@ -228,7 +222,7 @@ namespace watch_dogs_loc
             this.start = start;
         }
 
-        public void Read(ref uint id_begin, SubTableMeta subTable, Stream input)
+        public void Read(ref uint id_begin, SubTableMeta subTable, Stream input, MemoryMappedViewAccessor accessor, Loc loc)
         {
             ids = new List<List<Id>>();
 
@@ -266,12 +260,22 @@ namespace watch_dogs_loc
                     new_id.Read(ref k, ref current_size_in_bits, input);
                     ids_in_block.Add(new_id);
                 }
-                // Adjust offsets from the start
-                uint delta = ((uint)(input.Position - start)) << 3;
-                foreach (Id new_id in ids_in_block)
+                BitReader bitReader = new BitReader(accessor, (int)(input.Position * 8));
+                foreach (Id id in ids_in_block)
                 {
-                    new_id.lo += delta;
-                    new_id.hi += delta;
+                    if (id.is_pseudo)
+                    {
+                        continue;
+                    }
+                    List<uint> tree_pointers = new List<uint>();
+                    int remaining_bits = (int)id.increment;
+                    while (remaining_bits > 0)
+                    {
+                        uint entry = loc.FindTreePosition(bitReader, ref remaining_bits);
+                        tree_pointers.Add(entry);
+                    }
+                    bitReader.Seek(remaining_bits);
+                    id.tree_pointers = tree_pointers.ToArray();
                 }
                 ids.Add(ids_in_block);
             }
@@ -287,21 +291,18 @@ namespace watch_dogs_loc
         public uint increment;
 
         // calculated
-        public uint id, lo, hi;
+        public uint id;
 
 
         public String str;
-        public byte[] encoded;
+        public uint[] tree_pointers;
         public bool is_pseudo;
 
         public Id(uint id)
         {
             this.id = id;
-            this.lo = 1;
-            this.hi = 0;
             this.is_pseudo = false;
             this.str = null;
-            this.encoded = null;
         }
 
         public void Read(ref uint k, ref uint current_size_in_bits, Stream input)
@@ -334,9 +335,7 @@ namespace watch_dogs_loc
                     current_size = 2 * current_size + 4;
                 }
                 increment = current_size;
-                lo = current_size_in_bits;
                 current_size_in_bits += current_size;
-                hi = current_size_in_bits;
                 ++k;
             }
         }
@@ -370,6 +369,11 @@ namespace watch_dogs_loc
             uint answer = PeekBits(count);
             this.position += count;
             return answer;
+        }
+
+        public void Seek(int offset)
+        {
+            this.position += offset;
         }
     }
 }
