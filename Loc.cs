@@ -10,33 +10,24 @@ namespace watch_dogs_loc
 {
     public class Loc
     {
-        short magic, version;
         short language;
-        ushort table_length;
-        uint tree_offset;
         Table[] table;
-
-        uint tree_meta_offset;
-
         uint[] tree_meta;
-
-        uint nodes_count;
-
         uint[] tree_entries;
 
         public void Read(Stream input, MemoryMappedViewAccessor accessor)
         {
-            magic = input.ReadValueS16();
-            version = input.ReadValueS16();
+            short magic = input.ReadValueS16();
+            short version = input.ReadValueS16();
             if (magic != 0x4C53 /*LS*/ || version != 1)
             {
                 Console.WriteLine("Not a valid loc file!");
                 Environment.Exit(1);
             }
             language = input.ReadValueS16();
-            table_length = input.ReadValueU16();
-            tree_offset = input.ReadValueU32();
-            nodes_count = accessor.ReadUInt32(tree_offset);
+            ushort table_length = input.ReadValueU16();
+            uint tree_offset = input.ReadValueU32();
+            uint nodes_count = accessor.ReadUInt32(tree_offset);
             tree_entries = new uint[nodes_count];
             accessor.ReadArray(tree_offset, tree_entries, 0, (int)nodes_count);
             List<uint> tree_meta_tmp = new List<uint>();
@@ -194,10 +185,7 @@ namespace watch_dogs_loc
     public class Table
     {
         public uint first_id;
-        public uint offset_length; // 28 bits offset + 4 bits length
-
         public uint offset;
-        public uint length;
 
         public SubTableMeta[] sub_table_metas;
         public SubTableIds[] sub_table_ids;
@@ -205,12 +193,12 @@ namespace watch_dogs_loc
         public long Read(Stream input, MemoryMappedViewAccessor accessor, Loc loc)
         {
             first_id = input.ReadValueU32();
-            offset_length = input.ReadValueU32();
+            uint offset_length = input.ReadValueU32();
 
             long save = input.Position;
 
             offset = offset_length >> 4;
-            length = offset_length & 15;
+            uint length = offset_length & 15;
 
             // read meta data for each subtable
             input.Position = offset;
@@ -230,7 +218,7 @@ namespace watch_dogs_loc
 
                 block_first_id += sub_table_metas[i].delta_from_prev_id;
 
-                sub_table_ids[i] = new SubTableIds((uint)block_position);
+                sub_table_ids[i] = new SubTableIds();
                 sub_table_ids[i].Read(ref block_first_id, sub_table_metas[i], input, accessor, loc);
 
                 block_position += sub_table_metas[i].size;
@@ -244,13 +232,13 @@ namespace watch_dogs_loc
         public void Write(Stream output)
         {
             output.WriteValueU32(first_id);
-            output.WriteValueU32(offset << 4 | length);
+            output.WriteValueU32(offset << 4 | (uint)sub_table_metas.Length);
         }
 
         public void WriteData(Stream output, Loc loc)
         {
             MemoryStream subTablesData = new MemoryStream();
-            for (int i = 0; i < length; i++)
+            for (int i = 0; i < sub_table_metas.Length; i++)
             {
                 long start = subTablesData.Position;
                 sub_table_ids[i].Write(sub_table_metas[i], subTablesData, loc);
@@ -322,15 +310,6 @@ namespace watch_dogs_loc
     public class SubTableIds
     {
         public List<List<Id>> ids;
-
-        public uint start;
-
-        public byte[] raw;
-
-        public SubTableIds(uint start)
-        {
-            this.start = start;
-        }
 
         public void Read(ref uint id_begin, SubTableMeta subTable, Stream input, MemoryMappedViewAccessor accessor, Loc loc)
         {
