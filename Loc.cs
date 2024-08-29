@@ -238,12 +238,16 @@ namespace watch_dogs_loc
         public void WriteData(Stream output, Loc loc)
         {
             MemoryStream subTablesData = new MemoryStream();
+            List<SubTableMeta> newSubTableMetas = new List<SubTableMeta>();
+            uint id = first_id;
             for (int i = 0; i < sub_table_metas.Length; i++)
             {
-                long start = subTablesData.Position;
-                sub_table_ids[i].Write(sub_table_metas[i], subTablesData, loc);
-                sub_table_metas[i].size = (uint)(subTablesData.Position - start);
+                id += sub_table_metas[i].delta_from_prev_id;
+                List<SubTableMeta> newlyAdded = sub_table_ids[i].Write(sub_table_metas[i], subTablesData, loc, id);
+                newSubTableMetas.AddRange(newlyAdded);
+                id += sub_table_metas[i].max_id + 1;
             }
+            sub_table_metas = newSubTableMetas.ToArray();
             foreach (SubTableMeta meta in sub_table_metas)
             {
                 meta.Write(output);
@@ -372,34 +376,61 @@ namespace watch_dogs_loc
             id_begin += id_count;
         }
 
-        public void Write(SubTableMeta subTable, Stream output, Loc loc)
+        private List<Id> MakeFlatIdList()
         {
-            uint id_count = subTable.max_id + 1;
-            uint block_64ids_count = (id_count - 1) >> 6;
-
-            long start = output.Position;
-            ushort[] block_64ids_offsets = new ushort[block_64ids_count];
-            // write placeholder data
-            output.WriteBytes(new byte[block_64ids_count * 2]);
-
-            for (int i = 0; i < ids.Count; i++)
+            List<Id> result = new List<Id>();
+            foreach (List<Id> ids_in_block in ids)
             {
-                List<Id> ids_in_block = ids[i];
-                if (ids_in_block.Count == 0)
-                {
-                    continue;
-                }
-                if (i > 0)
-                {
-                    block_64ids_offsets[i - 1] = (ushort)(output.Position - start);
-                }
-                MemoryStream tmpBits = new MemoryStream();
-                BitWriter bitWriter = new BitWriter(tmpBits, 0);
                 foreach (Id id in ids_in_block)
                 {
-                    if (id.is_pseudo)
+                    if (!id.is_pseudo)
                     {
-                        continue;
+                        result.Add(id);
+                    }
+                }
+            }
+            return result;
+        }
+
+        public List<SubTableMeta> Write(SubTableMeta subTable, Stream output, Loc loc, uint startId)
+        {
+            const int sizeTreshold = 65536 - 2048;
+            List<SubTableMeta> newSubTables = new List<SubTableMeta>();
+            List<Id> flatIds = MakeFlatIdList();
+            int idx = 0;
+            while (idx < flatIds.Count)
+            {
+                uint last_written_offset = 0xFFFFFFFF;
+                List<ushort> block_64ids_offsets = new List<ushort>();
+                MemoryStream tmp = new MemoryStream();
+                MemoryStream tmpBits = new MemoryStream();
+                BitWriter bitWriter = new BitWriter(tmpBits, 0);
+                for (; idx < flatIds.Count; idx++)
+                {
+                    Id id = flatIds[idx];
+                    uint offset = id.id - startId;
+                    if (last_written_offset != 0xFFFFFFFF && (last_written_offset >> 6) != (offset >> 6))
+                    {
+                        // crossed a block treshold
+                        uint rounder = ~last_written_offset & 0x3f;
+                        Id.Skip(rounder, tmp);
+                        last_written_offset += rounder;
+                        while (((last_written_offset + 1) >> 6) != (offset >> 6))
+                        {
+                            block_64ids_offsets.Add(0);
+                            last_written_offset += 64;
+                        }
+                        bitWriter.Close();
+                        tmp.WriteBytes(tmpBits.ToArray());
+                        tmpBits = new MemoryStream();
+                        bitWriter = new BitWriter(tmpBits, 0);
+                        block_64ids_offsets.Add((ushort)tmp.Position);
+                    }
+                    Id.Skip(offset - last_written_offset - 1, tmp);
+                    last_written_offset = offset - 1;
+                    if (tmp.Position + tmpBits.Position >= sizeTreshold)
+                    {
+                        break;
                     }
                     int before = bitWriter.Position;
                     foreach (uint ptr in id.tree_pointers)
@@ -407,23 +438,28 @@ namespace watch_dogs_loc
                         loc.WriteTreePosition(bitWriter, ptr);
                     }
                     id.increment = (uint)(bitWriter.Position - before);
+                    id.Write(tmp);
+                    last_written_offset++;
                 }
-                bitWriter.Close();
-                foreach (Id id in ids_in_block)
+                long startPos = output.Position;
+                foreach (ushort offset in block_64ids_offsets)
                 {
-                    id.Write(output);
+                    output.WriteValueU16((ushort)(offset == 0 ? 0 : offset + block_64ids_offsets.Count * 2));
                 }
+                output.WriteBytes(tmp.ToArray());
+                bitWriter.Close();
                 output.WriteBytes(tmpBits.ToArray());
+                newSubTables.Add(new SubTableMeta
+                {
+                    max_id = last_written_offset,
+                    size = (uint)(output.Position - startPos),
+                    delta_from_prev_id = newSubTables.Count == 0 ? subTable.delta_from_prev_id : 0
+                });
+                startId += last_written_offset + 1;
             }
-            // replace placeholder data with real one
-            long end = output.Position;
-            output.Position = start;
-            foreach (ushort offset in block_64ids_offsets)
-            {
-                output.WriteValueU16(offset);
-            }
-            output.Position = end;
+            return newSubTables;
         }
+
     }
 
     public class Id
@@ -445,6 +481,22 @@ namespace watch_dogs_loc
             this.id = id;
             this.is_pseudo = false;
             this.str = null;
+        }
+
+        public Id(bool is_pseudo, uint increment)
+        {
+            this.is_pseudo = is_pseudo;
+            this.increment = increment;
+        }
+
+        public static void Skip(uint count, Stream output)
+        {
+            while (count > 0)
+            {
+                uint page = Math.Min(15, count);
+                new Id(true, page).Write(output);
+                count -= page;
+            }
         }
 
         public void Read(ref uint k, ref uint current_size_in_bits, Stream input)
