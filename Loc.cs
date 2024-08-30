@@ -98,26 +98,35 @@ namespace watch_dogs_loc
         {
             using (StreamWriter text = new StreamWriter(filename + ".txt", false, System.Text.Encoding.Unicode))
             {
-                foreach (Table t in table)
+                foreach (Id id in AllIds())
                 {
-                    foreach (SubTableIds ids in t.sub_table_ids)
+                    string line = DecodeString(id.tree_pointers);
+                    id.str = line;
+                    text.WriteLine(id.id + "=" + line.Replace("\r", "[CR]").Replace("\n", "[LF]"));
+                }
+            }
+        }
+
+        private IEnumerable<Id> AllIds()
+        {
+
+            foreach (Table t in table)
+            {
+                foreach (SubTableIds ids in t.sub_table_ids)
+                {
+                    foreach (List<Id> ids_64 in ids.ids)
                     {
-                        foreach (List<Id> ids_64 in ids.ids)
+                        foreach (Id id in ids_64)
                         {
-                            foreach (Id id in ids_64)
+                            if (!id.is_pseudo)
                             {
-                                if (id.is_pseudo)
-                                {
-                                    continue;
-                                }
-                                string line = DecodeString(id.tree_pointers);
-                                id.str = line;
-                                text.WriteLine(id.id + "=" + line.Replace("\r", "[CR]").Replace("\n", "[LF]"));
+                                yield return id;
                             }
                         }
                     }
                 }
             }
+
         }
 
         private string DecodeString(uint[] tree_positions)
@@ -176,6 +185,46 @@ namespace watch_dogs_loc
                     return;
                 }
             }
+        }
+
+        public void Update(Dictionary<uint, string> newStrings)
+        {
+
+            foreach (Id id in AllIds())
+            {
+                string newValue;
+                if (newStrings.TryGetValue(id.id, out newValue))
+                {
+                    id.str = newValue;
+                }
+            }
+        }           
+
+        public void ReCompress()
+        {
+            // This is just a dumb algorithm that uses one tree entry per character and does not attempt compression.
+            List<uint> newTreeEntries = new List<uint>();
+            newTreeEntries.Add(0); // Dummy
+            Dictionary<char, uint> entryForChar = new Dictionary<char, uint>();
+            foreach (Id id in AllIds())
+            {
+                List<uint> newTreePointers = new List<uint>();
+                foreach (char c in id.str)
+                {
+                    uint pointer;
+                    if (!entryForChar.TryGetValue(c, out pointer))
+                    {
+                        pointer = (uint)newTreeEntries.Count;
+                        newTreeEntries.Add(c);
+                        entryForChar[c] = pointer;
+                    }
+                    newTreePointers.Add(pointer);
+                }
+                id.tree_pointers = newTreePointers.ToArray();
+            }
+            newTreeEntries[0] = (uint)newTreeEntries.Count;
+            tree_entries = newTreeEntries.ToArray();
+            tree_meta = new uint[] { 0xFFFFFFFF, 0x8 };
         }
 
     }
@@ -542,6 +591,11 @@ namespace watch_dogs_loc
                 new Id(true, page).Write(output);
                 count -= page;
             }
+        }
+
+        public override string ToString()
+        {
+            return "id=" + id + " increment=" + (is_pseudo ? "*" : "") + increment + " tree_pointers=" + tree_pointers + " str=" + str;
         }
 
         public void Read(ref uint k, ref uint current_size_in_bits, Stream input)
