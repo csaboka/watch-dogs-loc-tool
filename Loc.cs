@@ -59,21 +59,24 @@ namespace watch_dogs_loc
             output.WriteValueS16(0x4c53);
             output.WriteValueS16(1);
             output.WriteValueS16(language);
-            output.WriteValueS16((short)table.Length);
+
+            List<Table> newTables = new List<Table>();
+            MemoryStream tableData = new MemoryStream();
+            foreach (Table oldTable in table)
+            {
+                List<Table> newlyAdded = oldTable.WriteData(tableData, this);
+                newTables.AddRange(newlyAdded);
+            }
+            output.WriteValueS16((short)newTables.Count);
             long tree_offset_pos = output.Position;
             output.WriteValueU32(0);
-            long table_start_pos = output.Position;
-            // Write dummy data just to advance the pointer. We'll come back and overwrite it at the end.
-            // This relies on the fact that table headers are fixed size.
-            foreach (Table table in table)
+            uint adjust = (uint)(output.Position + 8 * newTables.Count);
+            foreach (Table table in newTables)
             {
+                table.offset += adjust;
                 table.Write(output);
             }
-            foreach (Table table in table)
-            {
-                table.offset = (uint)output.Position;
-                table.WriteData(output, this);
-            }
+            output.WriteBytes(tableData.ToArray());
             while ((output.Position & 3) != 0)
             {
                 output.WriteByte(0);
@@ -89,11 +92,6 @@ namespace watch_dogs_loc
             }
             output.Position = tree_offset_pos;
             output.WriteValueU32((uint)tree_offset);
-            output.Position = table_start_pos;
-            foreach (Table table in table)
-            {
-                table.Write(output);
-            }
         }
 
         public void Export(String filename)
@@ -235,25 +233,66 @@ namespace watch_dogs_loc
             output.WriteValueU32(offset << 4 | (uint)sub_table_metas.Length);
         }
 
-        public void WriteData(Stream output, Loc loc)
+        public List<Table> WriteData(Stream output, Loc loc)
         {
-            MemoryStream subTablesData = new MemoryStream();
             List<SubTableMeta> newSubTableMetas = new List<SubTableMeta>();
+            List<byte[]> allChunks = new List<byte[]>();
             uint id = first_id;
             for (int i = 0; i < sub_table_metas.Length; i++)
             {
                 id += sub_table_metas[i].delta_from_prev_id;
-                List<SubTableMeta> newlyAdded = sub_table_ids[i].Write(sub_table_metas[i], subTablesData, loc, id);
-                newSubTableMetas.AddRange(newlyAdded);
+                List<byte[]> chunks = sub_table_ids[i].Write(sub_table_metas[i], loc, id, newSubTableMetas);
+                allChunks.AddRange(chunks);
                 id += sub_table_metas[i].max_id + 1;
             }
-            sub_table_metas = newSubTableMetas.ToArray();
-            foreach (SubTableMeta meta in sub_table_metas)
+
+            List<Table> tables = new List<Table>();
+            Table pendingTable = new Table();
+            pendingTable.offset = (uint)output.Position;
+            pendingTable.first_id = first_id;
+            id = first_id;
+            List<SubTableMeta> pendingMetas = new List<SubTableMeta>();
+            List<byte[]> pendingChunks = new List<byte[]>();
+            for (int i = 0; i < newSubTableMetas.Count; i++)
             {
-                meta.Write(output);
+                id += newSubTableMetas[i].delta_from_prev_id + newSubTableMetas[i].max_id + 1;
+                pendingMetas.Add(newSubTableMetas[i]);
+                pendingChunks.Add(allChunks[i]);
+                if (pendingMetas.Count == 15)
+                {
+                    pendingTable.sub_table_metas = pendingMetas.ToArray();
+                    pendingMetas = new List<SubTableMeta>();
+                    foreach (SubTableMeta meta in pendingTable.sub_table_metas)
+                    {
+                        meta.Write(output);
+                    }
+                    foreach (byte[] chunk in pendingChunks)
+                    {
+                        output.WriteBytes(chunk);
+                    }
+                    pendingChunks = new List<byte[]>();
+                    tables.Add(pendingTable);
+                    pendingTable = new Table();
+                    pendingTable.offset = (uint)output.Position;
+                    pendingTable.first_id = id;
+                }
             }
-            output.WriteBytes(subTablesData.ToArray());
+            if (pendingMetas.Count > 0)
+            {
+                pendingTable.sub_table_metas = pendingMetas.ToArray();
+                foreach (SubTableMeta meta in pendingTable.sub_table_metas)
+                {
+                    meta.Write(output);
+                }
+                foreach (byte[] chunk in pendingChunks)
+                {
+                    output.WriteBytes(chunk);
+                }
+                tables.Add(pendingTable);
+            }
+            return tables;
         }
+
     }
 
     public class SubTableMeta
@@ -392,10 +431,11 @@ namespace watch_dogs_loc
             return result;
         }
 
-        public List<SubTableMeta> Write(SubTableMeta subTable, Stream output, Loc loc, uint startId)
+        public List<byte[]> Write(SubTableMeta subTable, Loc loc, uint startId, List<SubTableMeta> subTables)
         {
-            const int sizeTreshold = 65536 - 2048;
-            List<SubTableMeta> newSubTables = new List<SubTableMeta>();
+            const int sizeTreshold = 65536 - 4096;
+            int startingSubTableCount = subTables.Count;
+            List<byte[]> result = new List<byte[]>();
             List<Id> flatIds = MakeFlatIdList();
             int idx = 0;
             while (idx < flatIds.Count)
@@ -441,7 +481,11 @@ namespace watch_dogs_loc
                     id.Write(tmp);
                     last_written_offset++;
                 }
-                long startPos = output.Position;
+                if (bitWriter.Position == 0 && tmp.Position == block_64ids_offsets.Last())
+                {
+                    block_64ids_offsets.RemoveAt(block_64ids_offsets.Count - 1);
+                }
+                MemoryStream output = new MemoryStream();
                 foreach (ushort offset in block_64ids_offsets)
                 {
                     output.WriteValueU16((ushort)(offset == 0 ? 0 : offset + block_64ids_offsets.Count * 2));
@@ -449,15 +493,16 @@ namespace watch_dogs_loc
                 output.WriteBytes(tmp.ToArray());
                 bitWriter.Close();
                 output.WriteBytes(tmpBits.ToArray());
-                newSubTables.Add(new SubTableMeta
+                result.Add(output.ToArray());
+                subTables.Add(new SubTableMeta
                 {
                     max_id = last_written_offset,
-                    size = (uint)(output.Position - startPos),
-                    delta_from_prev_id = newSubTables.Count == 0 ? subTable.delta_from_prev_id : 0
+                    size = (uint)(output.Position),
+                    delta_from_prev_id = subTables.Count == startingSubTableCount ? subTable.delta_from_prev_id : 0
                 });
                 startId += last_written_offset + 1;
             }
-            return newSubTables;
+            return result;
         }
 
     }
