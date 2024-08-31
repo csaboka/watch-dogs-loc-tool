@@ -94,15 +94,21 @@ namespace watch_dogs_loc
             output.WriteValueU32((uint)tree_offset);
         }
 
+        public void DecodeStrings()
+        {
+            foreach (Id id in AllIds())
+            {
+                id.str = DecodeString(id.tree_pointers);
+            }
+        }
+
         public void Export(String filename)
         {
             using (StreamWriter text = new StreamWriter(filename + ".txt", false, System.Text.Encoding.Unicode))
             {
                 foreach (Id id in AllIds())
                 {
-                    string line = DecodeString(id.tree_pointers);
-                    id.str = line;
-                    text.WriteLine(id.id + "=" + line.Replace("\r", "[CR]").Replace("\n", "[LF]"));
+                    text.WriteLine(id.id + "=" + id.str.Replace("\r", "[CR]").Replace("\n", "[LF]"));
                 }
             }
         }
@@ -189,14 +195,22 @@ namespace watch_dogs_loc
 
         public void Update(Dictionary<uint, string> newStrings)
         {
-
+            HashSet<uint> unseenKeys = new HashSet<uint>(newStrings.Keys);
             foreach (Id id in AllIds())
             {
                 string newValue;
                 if (newStrings.TryGetValue(id.id, out newValue))
                 {
                     id.str = newValue;
+                    unseenKeys.Remove(id.id);
+                } else
+                {
+                    Console.WriteLine("WARNING: ID {0} missing from the text file! Will keep current value from the LOC file", id.id);
                 }
+            }
+            if (unseenKeys.Count > 0)
+            {
+                Console.WriteLine("WARNING: IDs {0} were present in the text file but not in the LOC file. They were ignored. Please check the text file for typos.", string.Join(", ", unseenKeys));
             }
         }           
 
