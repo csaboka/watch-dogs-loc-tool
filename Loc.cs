@@ -203,6 +203,7 @@ namespace watch_dogs_loc
         public void ReCompress()
         {
             // This is just a dumb algorithm that uses one tree entry per character and does not attempt compression.
+            // It will break badly for input that has more than 253 unique characters, so Chinese and Japanese are out of luck so far...
             List<uint> newTreeEntries = new List<uint>();
             newTreeEntries.Add(0); // Dummy
             Dictionary<char, uint> entryForChar = new Dictionary<char, uint>();
@@ -224,7 +225,16 @@ namespace watch_dogs_loc
             }
             newTreeEntries[0] = (uint)newTreeEntries.Count;
             tree_entries = newTreeEntries.ToArray();
-            tree_meta = new uint[] { 0xFFFFFFFF, 0x8 };
+            // Looks like the game expects 12 tree_meta entries, so build a fake table where the first entry is always chosen.
+            // To be on the safe side, also re-use the original bit lengths.
+            tree_meta = new uint[] {
+                0xFF000000, 0x8,
+                0xFF010000, 0xa,
+                0xFF020000, 0xc,
+                0xFF030000, 0xe,
+                0xFF040000, 0x10,
+                0xFFFFFFFF, 0x18
+            };
         }
 
     }
