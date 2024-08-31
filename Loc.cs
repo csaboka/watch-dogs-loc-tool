@@ -483,9 +483,10 @@ namespace watch_dogs_loc
         public List<byte[]> Write(SubTableMeta subTable, Loc loc, uint startId, List<SubTableMeta> subTables)
         {
             const int sizeTreshold = 65536 - 4096;
-            int startingSubTableCount = subTables.Count;
             List<byte[]> result = new List<byte[]>();
             List<Id> flatIds = MakeFlatIdList();
+            SubTableMeta pendingSubTable = new SubTableMeta();
+            pendingSubTable.delta_from_prev_id = subTable.delta_from_prev_id;
             int idx = 0;
             while (idx < flatIds.Count)
             {
@@ -515,12 +516,12 @@ namespace watch_dogs_loc
                         bitWriter = new BitWriter(tmpBits, 0);
                         block_64ids_offsets.Add((ushort)tmp.Position);
                     }
-                    Id.Skip(offset - last_written_offset - 1, tmp);
-                    last_written_offset = offset - 1;
                     if (tmp.Position + tmpBits.Position >= sizeTreshold)
                     {
                         break;
                     }
+                    Id.Skip(offset - last_written_offset - 1, tmp);
+                    last_written_offset = offset - 1;
                     int before = bitWriter.Position;
                     foreach (uint ptr in id.tree_pointers)
                     {
@@ -543,13 +544,20 @@ namespace watch_dogs_loc
                 bitWriter.Close();
                 output.WriteBytes(tmpBits.ToArray());
                 result.Add(output.ToArray());
-                subTables.Add(new SubTableMeta
+                pendingSubTable.max_id = last_written_offset;
+                pendingSubTable.size = (uint)output.Position;
+                if (pendingSubTable.size > 0xFFFF)
                 {
-                    max_id = last_written_offset,
-                    size = (uint)(output.Position),
-                    delta_from_prev_id = subTables.Count == startingSubTableCount ? subTable.delta_from_prev_id : 0
-                });
-                startId += last_written_offset + 1;
+                    Console.WriteLine("Subtable got too big!");
+                    Environment.Exit(1);
+                }
+                subTables.Add(pendingSubTable);
+                if (idx < flatIds.Count)
+                {
+                    pendingSubTable = new SubTableMeta();
+                    pendingSubTable.delta_from_prev_id = flatIds[idx].id - startId - last_written_offset - 1;
+                    startId = flatIds[idx].id;
+                }
             }
             return result;
         }
