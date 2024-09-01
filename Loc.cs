@@ -407,15 +407,12 @@ namespace watch_dogs_loc
             }
             else
             {
-                uint tmp = 0x80000000 | (max_id << 16) | (delta_from_prev_id & 0xFFFF);
-                if (delta_from_prev_id > 0xFFFF)
-                {
-                    tmp |= 0x40000000;
-                }
+                bool largeDelta = delta_from_prev_id > 0xFFFF;
+                uint tmp = (largeDelta ? 0xc0000000 : 0x80000000) | (max_id << 16) | (delta_from_prev_id & 0xFFFF);
                 output.WriteValueU16((ushort)(tmp >> 16));
                 output.WriteValueU16((ushort)(tmp & 0xFFFF));
                 output.WriteValueU16((ushort)size);
-                if (delta_from_prev_id > 0xFFFF)
+                if (largeDelta)
                 {
                     output.WriteValueU16((ushort)(delta_from_prev_id >> 16));
                 }
@@ -445,7 +442,7 @@ namespace watch_dogs_loc
             for (uint j = 0; j < id_count; j += 64)
             {
                 List<Id> ids_in_block = new List<Id>();
-                if (j >= 64 && j % 64 == 0)
+                if (j >= 64)
                 {
                     long block_64ids_offset = block_64ids_offsets[(j >> 6) - 1];
                     if (block_64ids_offset == 0)
@@ -457,12 +454,11 @@ namespace watch_dogs_loc
                 }
 
                
-                uint current_size_in_bits = 0;
                 uint k = 0;
                 while (k < Math.Min(id_count - j, 64))
                 {
                     Id new_id = new Id(id_begin + j + k);
-                    new_id.Read(ref k, ref current_size_in_bits, input);
+                    new_id.Read(ref k, input);
                     ids_in_block.Add(new_id);
                 }
                 BitReader bitReader = new BitReader(accessor, (int)(input.Position * 8));
@@ -517,8 +513,7 @@ namespace watch_dogs_loc
                 uint last_written_offset = 0xFFFFFFFF;
                 List<ushort> block_64ids_offsets = new List<ushort>();
                 MemoryStream tmp = new MemoryStream();
-                MemoryStream tmpBits = new MemoryStream();
-                BitWriter bitWriter = new BitWriter(tmpBits, 0);
+                BitWriter bitWriter = new BitWriter();
                 for (; idx < flatIds.Count; idx++)
                 {
                     Id id = flatIds[idx];
@@ -534,13 +529,11 @@ namespace watch_dogs_loc
                             block_64ids_offsets.Add(0);
                             last_written_offset += 64;
                         }
-                        bitWriter.Close();
-                        tmp.WriteBytes(tmpBits.ToArray());
-                        tmpBits = new MemoryStream();
-                        bitWriter = new BitWriter(tmpBits, 0);
+                        tmp.WriteBytes(bitWriter.Finish());
+                        bitWriter = new BitWriter();
                         block_64ids_offsets.Add((ushort)tmp.Position);
                     }
-                    if (tmp.Position + tmpBits.Position >= sizeTreshold)
+                    if (tmp.Position + (bitWriter.Position / 8) >= sizeTreshold)
                     {
                         break;
                     }
@@ -565,8 +558,7 @@ namespace watch_dogs_loc
                     output.WriteValueU16((ushort)(offset == 0 ? 0 : offset + block_64ids_offsets.Count * 2));
                 }
                 output.WriteBytes(tmp.ToArray());
-                bitWriter.Close();
-                output.WriteBytes(tmpBits.ToArray());
+                output.WriteBytes(bitWriter.Finish());
                 result.Add(output.ToArray());
                 pendingSubTable.max_id = last_written_offset;
                 pendingSubTable.size = (uint)output.Position;
@@ -630,16 +622,16 @@ namespace watch_dogs_loc
             return "id=" + id + " increment=" + (is_pseudo ? "*" : "") + increment + " tree_pointers=" + tree_pointers + " str=" + str;
         }
 
-        public void Read(ref uint k, ref uint current_size_in_bits, Stream input)
+        public void Read(ref uint k, Stream input)
         {
             uint current_size = input.ReadValueU8();
             if (current_size > 0xF0)
             {
                 increment = current_size - 240;
-                k += (current_size - 240);
+                k += increment;
                 if (k > 64)
                 {
-                    Console.WriteLine("Extras! last id=" + id + " skip=" + (current_size - 240) + " extra=" + (k - 64));
+                    Console.WriteLine("Extras! last id=" + id + " skip=" + increment + " extra=" + (k - 64));
                     Environment.Exit(1);
                 }
                 is_pseudo = true;
@@ -649,18 +641,17 @@ namespace watch_dogs_loc
                 if (current_size == 0xF0)
                 {
                     current_size = input.ReadValueU8();
-                    current_size = ((current_size << 8) + input.ReadValueU8()) + 5340;
+                    current_size = (current_size << 8) + input.ReadValueU8() + 5340;
                 }
                 else if (current_size >= 0xDC)
                 {
-                    current_size = ((current_size << 8) + input.ReadValueU8()) - 56100;
+                    current_size = (current_size << 8) + input.ReadValueU8() - 56100;
                 }
                 if (current_size != 0)
                 {
                     current_size = 2 * current_size + 4;
                 }
                 increment = current_size;
-                current_size_in_bits += current_size;
                 ++k;
             }
         }
@@ -738,15 +729,9 @@ namespace watch_dogs_loc
 
     public class BitWriter
     {
-        readonly Stream stream;
+        List<byte> buffer = new List<byte>();
         ulong pendingBits;
         int pendingBitCount;
-
-        public BitWriter(Stream stream, int position)
-        {
-            this.stream = stream;
-            this.Position = position;
-        }
 
         public int Position { get; private set; }
 
@@ -760,19 +745,20 @@ namespace watch_dogs_loc
             pendingBitCount += bitCount;
             while (pendingBitCount >= 8)
             {
-                stream.WriteValueU8((byte)(pendingBits >> 56));
+                buffer.Add((byte)(pendingBits >> 56));
                 pendingBits <<= 8;
                 pendingBitCount -= 8;
             }
             Position += bitCount;
         }
 
-        public void Close()
+        public byte[] Finish()
         {
             if (pendingBitCount > 0)
             {
-                stream.WriteValueU8((byte)(pendingBits >> 56));
+                buffer.Add((byte)(pendingBits >> 56));
             }
+            return buffer.ToArray();
         }
     }
 }
