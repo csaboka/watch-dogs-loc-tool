@@ -123,10 +123,13 @@ namespace watch_dogs_loc
             {
                 foreach (Id id in AllIds())
                 {
-                    text.WriteLine(id.id + "=" + id.str.Replace("\r", "[CR]").Replace("\n", "[LF]"));
+                    if (!id.str.StartsWith("!(" + id.id + ")"))
+                    {
+                        text.WriteLine(id.id + "=" + id.str.Replace("\r", "[CR]").Replace("\n", "[LF]"));
                     }
                 }
-                }
+            }
+        }
 
         private IEnumerable<Id> AllIds()
         {
@@ -212,7 +215,7 @@ namespace watch_dogs_loc
                     unseenKeys.Remove(id.id);
                 } else
                 {
-                    Console.WriteLine("WARNING: ID {0} missing from the text file! Will keep current value from the LOC file", id.id);
+                    //Console.WriteLine("WARNING: ID {0} missing from the text file! Will keep current value from the LOC file", id.id);
                 }
             }
             if (unseenKeys.Count > 0)
