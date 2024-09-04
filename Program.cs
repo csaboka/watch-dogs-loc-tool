@@ -10,19 +10,40 @@ namespace watch_dogs_loc
         public static void Main(string[] args)
         {
             Console.WriteLine("Watch_Dogs 1, 2, and Legion .loc tool - celikeins - 2019.06.07");
-            if (args.Length != 1)
+            if (!ParseCommandLine(args, out string filename, out bool highEffort))
             {
-                Help();  
+                Help();
             }
-            if (args[0].EndsWith(".txt"))
+            if (filename.EndsWith(".txt"))
             {
-                Import(args[0]);
+                Import(filename, highEffort);
             }
             else
             {
-                Extract(args[0]);
+                Extract(filename);
             }
             Console.WriteLine("Done!");
+        }
+
+        private static bool ParseCommandLine(string[] args, out string filename, out bool highEffort)
+        {
+            highEffort = false;
+            int argPtr = 0;
+            if (argPtr < args.Length && args[argPtr] == "--compress")
+            {
+                highEffort = true;
+                argPtr++;
+            }
+            if (argPtr < args.Length)
+            {
+                filename = args[argPtr];
+                argPtr++;
+            }
+            else
+            {
+                filename = null;
+            }
+            return filename != null && argPtr == args.Length;
         }
 
         private static void Help()
@@ -32,8 +53,10 @@ namespace watch_dogs_loc
             Console.WriteLine("  {0} <loc_file>", executableName);
             Console.WriteLine("  Export <loc_file> to <loc_file>.txt.");
             Console.WriteLine(" OR");
-            Console.WriteLine("  {0} <loc_file>.txt", executableName);
+            Console.WriteLine("  {0} [--compress] <loc_file>.txt", executableName);
             Console.WriteLine("  Import from <loc_file>.txt to <loc_file>. The LOC file must already exist.");
+            Console.WriteLine("  With --compress, the file will be compressed to get close to the original file size. This may take several minutes.");
+            Console.WriteLine("  Without it, a low-effort algorithm is used that results in a large (but still valid) file.");
             Environment.Exit(42);
         }
 
@@ -55,7 +78,7 @@ namespace watch_dogs_loc
             loc.Export(locFileName);
         }
 
-        private static void Import(string textFileName)
+        private static void Import(string textFileName, bool highEffort)
         {
             Dictionary<uint, string> newEntries = new Dictionary<uint, string>();
             using (StreamReader text = new StreamReader(textFileName, System.Text.Encoding.Unicode))
@@ -88,7 +111,7 @@ namespace watch_dogs_loc
             loc.DecodeStrings();
             Console.WriteLine("Writing new LOC file...");
             loc.Update(newEntries);
-            loc.ReCompress();
+            loc.ReCompress(highEffort);
             using (Stream stream = new FileStream(locFileName, FileMode.Create))
             {
                 loc.Write(stream);

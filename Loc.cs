@@ -1,5 +1,7 @@
 ﻿using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.IO.MemoryMappedFiles;
 using System.Linq;
@@ -212,24 +214,55 @@ namespace watch_dogs_loc
             {
                 Console.WriteLine("WARNING: IDs {0} were present in the text file but not in the LOC file. They were ignored. Please check the text file for typos.", string.Join(", ", unseenKeys));
             }
-        }           
+        }
 
-        public void ReCompress()
+        public void ReCompress(bool highEffort)
         {
-            // This is just a dumb algorithm that uses one tree entry per character and does not attempt compression.
-            // It will break badly for input that has more than 253 unique characters, so Chinese and Japanese are out of luck so far...
+            Stopwatch grandTotal = new Stopwatch();
+            grandTotal.Start();
+            MakeStarterEntries();
+            if (highEffort)
+            {
+                // Until I figure out how to  rebuild tree_meta in the generic case, it isn't safe to use tree indices above
+                // what the original file could encode.
+                AddCompressionEntries((int)(((tree_meta[11] >> 8) - 1) & 0xFF00));
+                ShuffleEntriesByFrequency();
+            }
+
+            tree_entries[0] = (uint)tree_entries.Length;
+            if (tree_entries.Length < 0xFF)
+            {
+                // Looks like the game expects 12 tree_meta entries, so build a fake table where the first entry is always chosen.
+                // To be on the safe side, also re-use the original bit lengths.
+                tree_meta = new uint[] {
+                    0xFF000000, 0x8,
+                    0xFF010000, 0xa,
+                    0xFF020000, 0xc,
+                    0xFF030000, 0xe,
+                    0xFF040000, 0x10,
+                    0xFFFFFFFF, 0x18
+                };
+            }
+            if (highEffort)
+            {
+                Console.WriteLine("Total time spent compressing: " + grandTotal.Elapsed);
+            }
+        }
+
+        void MakeStarterEntries()
+        {
             List<uint> newTreeEntries = new List<uint>();
             newTreeEntries.Add(0); // Dummy
             Dictionary<char, uint> entryForChar = new Dictionary<char, uint>();
             foreach (Id id in AllIds())
             {
-                List<uint> newTreePointers = new List<uint>();
+                List<uint> newTreePointers = new List<uint>(id.str.Length);
                 foreach (char c in id.str)
                 {
                     uint pointer;
                     if (!entryForChar.TryGetValue(c, out pointer))
                     {
-                        pointer = (uint)newTreeEntries.Count;
+                        pointer = (ushort)newTreeEntries.Count;
                         newTreeEntries.Add(c);
                         entryForChar[c] = pointer;
                     }
@@ -237,20 +270,240 @@ namespace watch_dogs_loc
                 }
                 id.tree_pointers = newTreePointers.ToArray();
             }
-            newTreeEntries[0] = (uint)newTreeEntries.Count;
             tree_entries = newTreeEntries.ToArray();
-            // Looks like the game expects 12 tree_meta entries, so build a fake table where the first entry is always chosen.
-            // To be on the safe side, also re-use the original bit lengths.
-            tree_meta = new uint[] {
-                0xFF000000, 0x8,
-                0xFF010000, 0xa,
-                0xFF020000, 0xc,
-                0xFF030000, 0xe,
-                0xFF040000, 0x10,
-                0xFFFFFFFF, 0x18
-            };
         }
 
+        static long BloomFor(ushort value)
+        {
+            return 1L << (value & 63);
+        }
+
+        void AddCompressionEntries(int maxEntries)
+        {
+            // The general idea is that to optimize the file, we pick the pair of symbols that appear most frequently, introduce
+            // a new symbol for them, then replace all occurrences of the pair with the new symbol. Then we repeat this process,
+            // generating a new symbol and eliminating some tree pointers every time, until we run out of symbols we can allocate.
+
+            // This process requires iterating through the entries an ungodly amount of times, so we do our best to optimize things:
+            // - Pointers are converted from uints to ushorts to improve cache locality.
+            // - We build a simple 64-bit Bloom filter for each entry. This lets us quickly skip entries that don't contain both
+            //   symbols of the current pair. This starts out somewhat poorly (around 50% passing through, around 50% false positives),
+            //   but improves drastically after roughly a thousand iterations.
+            // - We periodically trim the pointer lists to bring the remaining items closer together in memory and improve cache locality.
+            List<uint> newTreeEntries = new List<uint>(tree_entries);
+            List<List<ushort>> allPointersList = new List<List<ushort>>();
+            PairFrequencies pairFrequencies = new PairFrequencies();
+            int total_len = 0;
+            List<long> bloomList = new List<long>();
+            foreach (Id id in AllIds())
+            {
+                total_len += id.tree_pointers.Length;
+                List<ushort> shortList = new List<ushort>(id.tree_pointers.Length);
+                shortList.AddRange(id.tree_pointers.Select(ptr => (ushort)ptr));
+                allPointersList.Add(shortList);
+                for (int i = 0; i < shortList.Count - 1; i++)
+                {
+                    pairFrequencies.AddPair(shortList[i], shortList[i + 1]);
+                }
+                long bloomThis = 0;
+                foreach (ushort pointer in shortList)
+                {
+                    bloomThis |= BloomFor(pointer);
+                }
+                bloomList.Add(bloomThis);
+            }
+            int starting_total_len = total_len;
+
+            List<ushort>[] allPointersArray = allPointersList.ToArray();
+            long[] bloomArray = bloomList.ToArray();
+            uint prevBestCount = uint.MaxValue;
+            while (newTreeEntries.Count < maxEntries)
+            {
+                PairFrequency bestPair = new PairFrequency();
+                foreach (PairFrequency pair in pairFrequencies)
+                {
+                    if (pair.count > bestPair.count)
+                    {
+                        bestPair = pair;
+                        if (bestPair.count == prevBestCount)
+                        {
+                            // Each iteration strictly increases the diversity of existing pairs, so if we already found a
+                            // pair as popular as the previous one, we can stop as there won't be any more popular ones.
+                            break;
+                        }
+                    }
+                }
+                prevBestCount = bestPair.count;
+                if ((newTreeEntries.Count & 0xFF) == 0)
+                {
+                    if ((newTreeEntries.Count & 2047) == 0)
+                    {
+                        foreach (List<ushort> pointers in allPointersArray)
+                        {
+                            pointers.TrimExcess();
+                        }
+                    }
+                    Console.Write("Progress: {0:P}, estimated size factor: {1:P}\r", (double)newTreeEntries.Count / maxEntries, (double)total_len / starting_total_len);
+                }
+                ushort pointer = (ushort)newTreeEntries.Count;
+                newTreeEntries.Add((uint)bestPair.first << 16 | bestPair.second);
+                long filter = BloomFor(bestPair.first) | BloomFor(bestPair.second);
+                // replace all pairs with this new entry while updating the bookkeeping
+                for (int bloomIdx = 0; bloomIdx < bloomArray.Length; bloomIdx++)
+                {
+                    if ((bloomArray[bloomIdx] & filter) != filter)
+                    {
+                        continue;
+                    }
+                    List<ushort> pointers = allPointersArray[bloomIdx];
+                    int startIndex = 0;
+                    bool hadChange = false;
+                    while (startIndex < pointers.Count)
+                    {
+                        int idx = pointers.IndexOf(bestPair.first, startIndex);
+                        if (idx < 0 || idx == pointers.Count - 1)
+                        {
+                            break;
+                        }
+                        if (pointers[idx + 1] == bestPair.second)
+                        {
+                            if (idx > 0)
+                            {
+                                pairFrequencies.RemovePair(pointers[idx - 1], pointers[idx]);
+                                pairFrequencies.AddPair(pointers[idx - 1], pointer);
+                            }
+                            pairFrequencies.RemovePair(bestPair.first, bestPair.second);
+                            if (idx < pointers.Count - 2)
+                            {
+                                pairFrequencies.RemovePair(pointers[idx + 1], pointers[idx + 2]);
+                                pairFrequencies.AddPair(pointer, pointers[idx + 2]);
+                            }
+                            pointers.RemoveAt(idx + 1);
+                            total_len--;
+                            pointers[idx] = pointer;
+                            hadChange = true;
+                        }
+                        startIndex = idx + 1;
+                    }
+                    if (hadChange)
+                    {
+                        bloomArray[bloomIdx] = 0;
+                        foreach (ushort ptr in pointers)
+                        {
+                            bloomArray[bloomIdx] |= BloomFor(ptr);
+                        }
+                    }
+                }
+            }
+
+            int repackIndex = 0;
+            foreach (Id id in AllIds())
+            {
+                id.tree_pointers = allPointersArray[repackIndex++].Select(ptr => (uint)ptr).ToArray();
+            }
+            tree_entries = newTreeEntries.ToArray();
+
+            Console.WriteLine("Progress: {0:P}, estimated size factor: {1:P}", 1, (double)total_len / starting_total_len);
+        }
+
+        void ShuffleEntriesByFrequency()
+        {
+            // Lower indices are cheaper to encode, so reorder the tree to make the most popular symbols appear first.
+            // This will also neatly move the symbols that aren't used directly (i.e. only referenced by other tree entries)
+            // to the very end. Since those entries never need to be encoded, any index is fine for them.
+            uint[] frequencies = new uint[tree_entries.Length];
+            foreach (Id id in AllIds())
+            {
+                foreach (uint ptr in id.tree_pointers)
+                {
+                    frequencies[ptr]++;
+                }
+            }
+            // Index 0 is special, make sure it stays the first by giving it a dummy frequency.
+            frequencies[0] = uint.MaxValue;
+            uint[] translationTable = new uint[tree_entries.Length];
+            uint newIdx = 0;
+            foreach (int oldIdx in Enumerable.Range(0, tree_entries.Length).OrderByDescending(i => frequencies[i]))
+            {
+                translationTable[oldIdx] = newIdx++;
+            }
+
+            foreach (Id id in AllIds())
+            {
+                id.tree_pointers = id.tree_pointers.Select(w => translationTable[w]).ToArray();
+            }
+
+            uint[] newTreeEntries = new uint[tree_entries.Length];
+            for (int i=1; i< tree_entries.Length; i++)
+            {
+                uint entry = tree_entries[i];
+                if (entry > 0xFFFF)
+                {
+                    uint first = translationTable[entry >> 16];
+                    uint second = translationTable[entry & 0xFFFF];
+                    entry = (first << 16) | second;
+                }
+                newTreeEntries[translationTable[i]] = entry;
+            }
+            tree_entries = newTreeEntries;
+        }
+
+    }
+
+    struct PairFrequency
+    {
+        public ushort first;
+        public ushort second;
+        public uint count;
+    }
+
+    class PairFrequencies : IEnumerable<PairFrequency>
+    {
+        private Dictionary<uint, uint> freq = new Dictionary<uint, uint>();
+
+        uint MakeKey(ushort first, ushort second)
+        {
+            return ((uint)first << 16) | second;
+        }
+
+        public void AddPair(ushort first, ushort second)
+        {
+            uint key = MakeKey(first, second);
+            uint count;
+            freq.TryGetValue(key, out count);
+            freq[key] = count + 1;
+        }
+
+        public void RemovePair(ushort first, ushort second)
+        {
+            uint key = MakeKey(first, second);
+            uint newCount = --freq[key];
+            if (newCount == 0)
+            {
+                freq.Remove(key);
+            }
+        }
+
+        public IEnumerator<PairFrequency> GetEnumerator()
+        {
+            foreach (var pair in freq)
+            {
+                yield return new PairFrequency
+                {
+                    first = (ushort)(pair.Key >> 16),
+                    second = (ushort)(pair.Key & 0xFFFF),
+                    count = pair.Value
+                };
+            }
+        }
+
+        IEnumerator IEnumerable.GetEnumerator()
+        {
+            foreach (PairFrequency pf in this)
+            {
+                yield return pf;
+            }
+        }
     }
 
     public class Table
