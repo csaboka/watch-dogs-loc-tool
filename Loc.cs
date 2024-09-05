@@ -316,24 +316,47 @@ namespace watch_dogs_loc
 
             List<ushort>[] allPointersArray = allPointersList.ToArray();
             long[] bloomArray = bloomList.ToArray();
-            uint prevBestCount = uint.MaxValue;
+            // Iterating through the frequency table is pretty expensive, so in addition to picking a winner,
+            // collect all the ties as well. Then consume all the ties before going through the frequency table again.
+            // We need to revalidate the pending items because their frequency may have been decreased by the previous
+            // replacements, but even with that step, this approach is much faster than a naive one.
+            Queue<PairFrequency> tiedForBest = new Queue<PairFrequency>();
             while (newTreeEntries.Count < maxEntries)
             {
-                PairFrequency bestPair = new PairFrequency();
-                foreach (PairFrequency pair in pairFrequencies)
+                PairFrequency bestPair;
+                while (tiedForBest.Count > 0)
                 {
-                    if (pair.count > bestPair.count)
+                    PairFrequency top = tiedForBest.Peek();
+                    if (top.count == pairFrequencies.GetPairFrequency(top.first, top.second))
                     {
-                        bestPair = pair;
-                        if (bestPair.count == prevBestCount)
+                        break;
+                    }
+                    else
+                    {
+                        // stale entry, get rid of it
+                        tiedForBest.Dequeue();
+                    }
+                }
+                if (tiedForBest.Count > 0)
+                {
+                    bestPair = tiedForBest.Dequeue();
+                }
+                else
+                {
+                    bestPair = new PairFrequency();
+                    foreach (PairFrequency pair in pairFrequencies)
+                    {
+                        if (pair.count > bestPair.count)
                         {
-                            // Each iteration strictly increases the diversity of existing pairs, so if we already found a
-                            // pair as popular as the previous one, we can stop as there won't be any more popular ones.
-                            break;
+                            bestPair = pair;
+                            tiedForBest.Clear();
+                        }
+                        else if (pair.count == bestPair.count)
+                        {
+                            tiedForBest.Enqueue(pair);
                         }
                     }
                 }
-                prevBestCount = bestPair.count;
                 if ((newTreeEntries.Count & 0xFF) == 0)
                 {
                     if ((newTreeEntries.Count & 2047) == 0)
@@ -482,6 +505,12 @@ namespace watch_dogs_loc
             {
                 freq.Remove(key);
             }
+        }
+
+        public uint GetPairFrequency(ushort first, ushort second)
+        {
+            freq.TryGetValue(MakeKey(first, second), out uint result);
+            return result;
         }
 
         public IEnumerator<PairFrequency> GetEnumerator()
