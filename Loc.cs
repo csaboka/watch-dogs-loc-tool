@@ -111,9 +111,9 @@ namespace watch_dogs_loc
                 foreach (Id id in AllIds())
                 {
                     text.WriteLine(id.id + "=" + id.str.Replace("\r", "[CR]").Replace("\n", "[LF]"));
+                    }
                 }
-            }
-        }
+                }
 
         private IEnumerable<Id> AllIds()
         {
@@ -223,29 +223,35 @@ namespace watch_dogs_loc
             MakeStarterEntries();
             if (highEffort)
             {
-                // Until I figure out how to  rebuild tree_meta in the generic case, it isn't safe to use tree indices above
-                // what the original file could encode.
-                AddCompressionEntries((int)(((tree_meta[11] >> 8) - 1) & 0xFF00));
+                // We could have the user specify different tree sizes to balance speed against size. For now, we go all out.
+                AddCompressionEntries(0x10000);
                 ShuffleEntriesByFrequency();
             }
 
             tree_entries[0] = (uint)tree_entries.Length;
-            if (tree_entries.Length < 0xFF)
-            {
-                // Looks like the game expects 12 tree_meta entries, so build a fake table where the first entry is always chosen.
-                // To be on the safe side, also re-use the original bit lengths.
-                tree_meta = new uint[] {
-                    0xFF000000, 0x8,
-                    0xFF010000, 0xa,
-                    0xFF020000, 0xc,
-                    0xFF030000, 0xe,
-                    0xFF040000, 0x10,
-                    0xFFFFFFFF, 0x18
-                };
-            }
             if (highEffort)
             {
+                tree_meta = BuildNewTreeMeta();
                 Console.WriteLine("Total time spent compressing: " + grandTotal.Elapsed);
+            }
+            else
+            {
+                // Encode everything at the same length, using the smallest length that works. This will be 8 bits for most languages,
+                // but for languages that use more than 200ish symbols, a bigger length will be necessary (think Chinese).
+                tree_meta = new uint[] {
+                    0xFFFFFF00, 0x8,
+                    0xFFFFFF20, 0xa,
+                    0xFFFFFF40, 0xc,
+                    0xFFFFFF60, 0xe,
+                    0xFFFFFFFE, 0x10,
+                    0xFFFFFFFF, 0x18
+                };
+                uint i = 0;
+                while ((1 << BIT_LENGTHS[i]) < tree_entries.Length)
+                {
+                    tree_meta[2 * i] = 0;
+                    i++;
+                }
             }
         }
 
@@ -469,6 +475,179 @@ namespace watch_dogs_loc
                 newTreeEntries[translationTable[i]] = entry;
             }
             tree_entries = newTreeEntries;
+        }
+
+        static readonly int[] BIT_LENGTHS = { 8, 10, 12, 14, 16, 24 };
+
+        static readonly int[] BIT_SPACE_SHIFTS = { 16, 14, 12, 10 };
+
+        static int GetPenultimateBinSize(int[] binSizes, int numSymbolsUsed)
+        {
+            // We are filling the space of all 24-bit values with our symbols.
+            // 8-bit values "use up" 2^16 values of that space, 10-bit values use 2^14 values, and so on.
+            // The remaining space after allocating the first four bins is shared between 16-bit and 24-bit values.
+            // We know that 16-bit values use 256 values each and 24-bit values use just one. So this equality must hold:
+            // 256*bin_16 + bin_24 = remaining_bit_space
+            // We also know that the bins must cover all symbols:
+            // bin_8 + bin_10 + bin_12 + bin_14 + bin_16 + bin_24 = numSymbolsUsed
+            //
+            // Solving for bin_16 yields:
+            // bin_16 = (remaining_bit_space + numSymbolsUsed - bin_8 - bin_10 - bin_12 - bin_14) / 255
+
+            // Symbol zero is unused, so subtract it from the first non-empty bin.
+            int firstNonZeroAdjust = -1;
+            int bitSpaceUsed = 0;
+            int remainingSymbols = numSymbolsUsed - 1; // Adjust for zero being unused.
+            for (int i = 0; i < 4; i++)
+            {
+                remainingSymbols -= binSizes[i];
+                if (binSizes[i] != 0)
+                {
+                    bitSpaceUsed += (binSizes[i] + firstNonZeroAdjust) << BIT_SPACE_SHIFTS[i];
+                    firstNonZeroAdjust = 0;
+                }
+            }
+            int remainingBitSpace = 0x1000000 - bitSpaceUsed;
+            if (remainingSymbols < 0 || remainingBitSpace < 0 || remainingBitSpace < remainingSymbols)
+            {
+                // impossible case, the symbol space or the bit space got over-allocated
+                return -1;
+            }
+            return (remainingBitSpace - remainingSymbols) / 255;
+        }
+
+        static long GetCost(int[] binSizes, int[] frequencies, int numSymbolsUsed)
+        {
+            // We return long.MaxValue for impossible cases, to make sure our optimization algorithm never picks them, without having to manually check there.
+            if (binSizes[0] < 0 || binSizes[1] < 0 || binSizes[2] < 0 || binSizes[3] < 0)
+            {
+                return long.MaxValue;
+            }
+            int penultimateBinSize = GetPenultimateBinSize(binSizes, numSymbolsUsed);
+            if (penultimateBinSize < 0)
+            {
+                return long.MaxValue;
+            }
+            long cost = 0;
+            int numSymbolsSoFar = 0;
+            for (int i = 0; i < 4; i++)
+            {
+                cost += (long)BIT_LENGTHS[i] * new ArraySegment<int>(frequencies, numSymbolsSoFar, binSizes[i]).Sum();
+                numSymbolsSoFar += binSizes[i];
+            }
+            cost += 16L * new ArraySegment<int>(frequencies, numSymbolsSoFar, Math.Min(penultimateBinSize, frequencies.Length - numSymbolsSoFar)).Sum();
+            numSymbolsSoFar += penultimateBinSize;
+            if (numSymbolsSoFar < frequencies.Length && numSymbolsUsed > numSymbolsSoFar)
+            {
+                cost += 24L * new ArraySegment<int>(frequencies, numSymbolsSoFar, numSymbolsUsed - numSymbolsSoFar).Sum();
+            }
+            return cost;
+        }
+
+        uint[] BuildNewTreeMeta()
+        {
+            // I'm sure there is an elegant and efficient method to find the optimal bin allocation, but I can't figure it out and can't find it online.
+            // Instead, we do a naive hill climbing algorithm that nudges values up and down to find better solutions.
+            // There is no guarantee that it finds the best solution, but should be good enough in practice.
+
+            int[] frequencies = new int[tree_entries.Length];
+            foreach (Id id in AllIds())
+            {
+                foreach (uint ptr in id.tree_pointers)
+                {
+                    frequencies[ptr]++;
+                }
+            }
+
+            int numSymbolsUsed = tree_entries.Length;
+            while (frequencies[numSymbolsUsed - 1] == 0)
+            {
+                numSymbolsUsed--;
+            }
+
+            const int maxIterations = 50;
+            int[] binSizes = { 1, 0, 0, 0 }; // Starting state: everything gets 16 bits, symbol 0 is arbitrarily added to the first bin.
+            for (int iteration = 0; iteration < maxIterations; iteration++)
+            {
+                int[] startingBinSizes = (int[])binSizes.Clone();
+                long cost = GetCost(binSizes, frequencies, numSymbolsUsed);
+                for (int binToTweak = 0; binToTweak < 4; binToTweak++)
+                {
+                    binSizes[binToTweak]++;
+                    long upNeighborCost = GetCost(binSizes, frequencies, numSymbolsUsed);
+                    int direction;
+                    if (upNeighborCost < cost)
+                    {
+                        direction = +1;
+                        cost = upNeighborCost;
+                    }
+                    else
+                    {
+                        direction = -1;
+                        binSizes[binToTweak]--;
+                    }
+                    while (true)
+                    {
+                        binSizes[binToTweak] += direction;
+                        long neighborCost = GetCost(binSizes, frequencies, numSymbolsUsed);
+                        if (neighborCost < cost)
+                        {
+                            cost = neighborCost;
+                        }
+                        else
+                        {
+                            binSizes[binToTweak] -= direction;
+                            break;
+                        }
+                    }
+                }
+                if (StructuralComparisons.StructuralEqualityComparer.Equals(startingBinSizes, binSizes))
+                {
+                    // We have reached local optimum, further iterations are pointless.
+                    break;
+                }
+            }
+
+            // finally, build the meta array from bin sizes
+            Array.Resize(ref binSizes, 6);
+            binSizes[4] = GetPenultimateBinSize(binSizes, numSymbolsUsed);
+            binSizes[5] = numSymbolsUsed - new ArraySegment<int>(binSizes, 0, 5).Sum();
+            for (int i = 0; i < 6; i++)
+            {
+                if (binSizes[i] != 0)
+                {
+                    binSizes[i]--;
+                    break;
+                }
+            }
+            uint[] newMeta = new uint[12];
+            uint binarySpacePtr = 0;
+            uint symbolPointer = 1;
+            for (int i = 0; i < 6; i++)
+            {
+                int binSize = binSizes[i];
+                uint newBinarySpacePtr = binarySpacePtr + (uint)(binSize << (32 - BIT_LENGTHS[i]));
+                uint offset;
+                if (binSize == 0)
+                {
+                    offset = 0xFFFFFFE0;
+                }
+                else
+                {
+                    offset = (symbolPointer << (32 - BIT_LENGTHS[i])) - binarySpacePtr;
+                }
+                newMeta[i * 2] = newBinarySpacePtr;
+                newMeta[i * 2 + 1] = offset | (uint)BIT_LENGTHS[i];
+                binarySpacePtr = newBinarySpacePtr;
+                symbolPointer += (uint)binSize;
+            }
+            // Original files always have 0xFFFFFFFF for the threshold of the last entry, even if some
+            // bit combinations ended up being unused. Do the same for compatibility. It also solves
+            // the edge case where all bit combinations are used, and the final threshold becomes
+            // 0x100000000, which overflows to zero.
+            newMeta[10] = 0xFFFFFFFF;
+
+            return newMeta;
         }
 
     }
