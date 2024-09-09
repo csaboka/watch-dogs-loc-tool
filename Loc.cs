@@ -16,6 +16,7 @@ namespace watch_dogs_loc
         Table[] table;
         uint[] tree_meta;
         uint[] tree_entries;
+        uint[] max_symbol_per_bin;
 
         public void Read(Stream input, MemoryMappedViewAccessor accessor)
         {
@@ -58,6 +59,18 @@ namespace watch_dogs_loc
 
         public void Write(Stream output)
         {
+            max_symbol_per_bin = new uint[tree_meta.Length / 2];
+            for (int i = 0; i < max_symbol_per_bin.Length; i++)
+            {
+                uint threshold = tree_meta[2 * i];
+                if (threshold != 0 && (i == 0 || threshold != tree_meta[2 * i - 2]))    // skip empty bins, leave them zero
+                {
+                    uint offset = tree_meta[2 * i + 1] & ~0x1fu;
+                    int bits = (int)(tree_meta[2 * i + 1] & 0x1f);
+                    max_symbol_per_bin[i] = (threshold + offset) >> (32 - bits);
+                }
+            }
+
             output.WriteValueS16(0x4c53);
             output.WriteValueS16(1);
             output.WriteValueS16(language);
@@ -176,23 +189,15 @@ namespace watch_dogs_loc
 
         public void WriteTreePosition(BitWriter writer, uint value)
         {
-            for (int i = 0; ; i += 2)
+            int i = 0;
+            while (value >= max_symbol_per_bin[i])
             {
-                uint offset = tree_meta[i + 1];
-                int bits_to_write = (int)(offset & 0x1F);
-                uint candidate = (value << (32 - bits_to_write)) - (offset & ~0x1fu);
-                bool matchesEarlier = false;
-                for (int j = 0; j < i; j += 2)
-                {
-                    matchesEarlier |= candidate < tree_meta[j];
-                }
-                if (!matchesEarlier && candidate < tree_meta[i] && ((candidate + offset) >> (32 - bits_to_write)) == value)
-                {
-                    // found the right offset and bit count
-                    writer.Write(candidate >> (32 - bits_to_write), bits_to_write);
-                    return;
-                }
+                i++;
             }
+            uint offsetAndBits = tree_meta[2 * i + 1];
+            uint offset = offsetAndBits & ~0x1fu;
+            int bits = (int)(offsetAndBits & 0x1f);
+            writer.Write(value - (offset >> (32 - bits)), bits);
         }
 
         public void Update(Dictionary<uint, string> newStrings)
@@ -1202,6 +1207,7 @@ namespace watch_dogs_loc
             {
                 throw new ArgumentException("Bit count out of range: " + bitCount);
             }
+            bits &= (uint)(1ul << bitCount) - 1;
             pendingBits |= (ulong)bits << (64 - bitCount - pendingBitCount);
             pendingBitCount += bitCount;
             while (pendingBitCount >= 8)
